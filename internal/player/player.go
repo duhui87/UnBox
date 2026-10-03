@@ -131,6 +131,7 @@ const (
 	EventError                      // 播放出错，Err 非空
 	EventEOF                        // 播放自然结束
 	EventPlaying                    // 已开始或恢复播放
+	EventQuit                       // 播放器进程退出（如 mpv OSC 关闭按钮）；不代表播放失败，不触发故障切换
 )
 
 // Event 是播放器上报的异步事件。

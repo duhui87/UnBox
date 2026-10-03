@@ -29,7 +29,9 @@ func main() {
 	}
 	pl := p // player.Player，可能 nil
 	if p != nil {
-		pl = failover.New(p, probe.NewProber())
+		// Embed 先于 failover：故障切换的 Load 也要经过嵌入装饰器，
+		// 否则切源后 mpv 走独立窗口而 overlay 不再显隐。
+		pl = failover.New(shell.Embed(p), probe.NewProber())
 	}
 	st, serr := store.Open(appDataPath())
 	if serr != nil {

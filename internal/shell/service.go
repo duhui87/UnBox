@@ -267,6 +267,7 @@ func NewShellService(pv provider.Provider, p player.Player, st *store.Store) *Sh
 // ServiceShutdown 在 Wails 退出服务阶段释放媒体库 HTTP 服务和播放资源。
 func (s *ShellService) ServiceShutdown() error {
 	s.stopPlaybackBridge()
+	shutdownEmbed()
 	var firstErr error
 	if s.library != nil {
 		firstErr = s.library.Close()
@@ -1868,11 +1869,24 @@ func (s *ShellService) RefreshMPV() (mpvplugin.Status, error) {
 	if err != nil {
 		return status, err
 	}
-	if err := s.playback.SetMPV(p); err != nil {
+	if err := s.attachMPVPlayer(p); err != nil {
 		return status, err
 	}
-	s.player = p
 	return status, nil
+}
+
+// attachMPVPlayer 把新播放器换入服务与控制器，并重启事件桥接到新通道。
+//
+// 新播放器经 Embed 接上主窗口嵌入装饰器（overlay 显隐随其生命周期）。
+// controller.SetMPV 只可能以「旧播放器 Close 的错误」返回——换入本身必然
+// 生效——所以先同步 s.player 再换入，保证服务侧与控制器不分叉。
+func (s *ShellService) attachMPVPlayer(p player.Player) error {
+	wrapped := Embed(p)
+	s.stopPlaybackBridge()
+	s.player = wrapped
+	err := s.playback.SetMPV(wrapped)
+	s.startPlaybackBridge()
+	return err
 }
 
 func toVodItems(items []provider.Item) []VodItem {

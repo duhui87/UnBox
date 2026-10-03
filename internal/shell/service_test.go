@@ -692,6 +692,60 @@ func newBridgeTestPlayer() *bridgeTestPlayer {
 	return &bridgeTestPlayer{events: make(chan player.Event, 16)}
 }
 
+// TestAttachMPVPlayerSwapsControllerAndRestartsBridge 保证 RefreshMPV 的换入
+// 路径：新播放器经 Embed 接上嵌入装饰器、同步换进控制器与服务侧、事件桥接
+// 重启到新通道。否则换入后前端再也收不到 playback:event——旧桥接可能一直
+// 阻塞在旧通道上（旧播放器不会再发事件）。
+func TestAttachMPVPlayerSwapsControllerAndRestartsBridge(t *testing.T) {
+	old := newBridgeTestPlayer()
+	svc := newShellService(nil, old, nil)
+
+	var mu sync.Mutex
+	var got []PlaybackEvent
+	svc.playbackEventEmitter = func(ev PlaybackEvent) {
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+	}
+	svc.startPlaybackBridge()
+	defer func() { _ = svc.ServiceShutdown() }()
+
+	if _, ok := svc.claimPlayback(11); !ok {
+		t.Fatal("claimPlayback 应接受首个 token")
+	}
+
+	next := newBridgeTestPlayer()
+	if err := svc.attachMPVPlayer(next); err != nil {
+		t.Fatalf("attachMPVPlayer: %v", err)
+	}
+	if svc.playback == nil || !svc.playback.MPVReady() {
+		t.Fatal("控制器未换入新播放器")
+	}
+	if svc.player == nil {
+		t.Fatal("服务侧播放器未更新")
+	}
+
+	// 新通道上的事件应经重启后的桥接到达出口。
+	next.events <- player.Event{Kind: player.EventPlaying}
+	waitForBridgeEvents(t, &mu, &got, 1)
+	mu.Lock()
+	if len(got) != 1 || got[0].Token != 11 || got[0].Kind != "playing" {
+		mu.Unlock()
+		t.Fatalf("got %#v, want 一条 {Token:11 Kind:playing}", got)
+	}
+	mu.Unlock()
+
+	// 旧通道的事件不应再被转发（旧桥接与旧嵌入循环均已停）。
+	old.events <- player.Event{Kind: player.EventPlaying}
+	time.Sleep(40 * time.Millisecond)
+	mu.Lock()
+	if n := len(got); n != 1 {
+		mu.Unlock()
+		t.Fatalf("换入后旧通道仍被转发（共 %d 条）", n)
+	}
+	mu.Unlock()
+}
+
 func TestPlaybackBridgeFiltersTokenAndStops(t *testing.T) {
 	inner := newBridgeTestPlayer()
 	// 先注入事件出口再启动桥接，避免与桥接 goroutine 并发写字段。

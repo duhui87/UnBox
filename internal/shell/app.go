@@ -25,6 +25,7 @@ import (
 	"github.com/unbox/unbox/internal/provider"
 	"github.com/unbox/unbox/internal/store"
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 )
 
 // testStreamURL 是 M1 冒烟用的一条公开 HLS 测试流（mux test-streams）。
@@ -129,7 +130,7 @@ func NewApp(p player.Player, pv provider.Provider, st *store.Store) *application
 
 // OpenWindow 在 app 上创建并打开主窗口。
 func OpenWindow(app *application.App) *application.WebviewWindow {
-	return app.Window.NewWithOptions(application.WebviewWindowOptions{
+	win := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            "UnBox",
 		Width:            1000,
 		Height:           618,
@@ -138,4 +139,24 @@ func OpenWindow(app *application.App) *application.WebviewWindow {
 		BackgroundColour: application.NewRGB(6, 7, 15),
 		URL:              "/",
 	})
+	attachEmbedWindow(win)
+	return win
+}
+
+// attachEmbedWindow 注入 mpv 嵌入宿主并订阅窗口尺寸变化：
+//   - 宿主句柄经闭包延迟读取——窗口句柄创建后才可用，而首次 Load（播放）
+//     必然发生在窗口打开之后；读到 0（未就绪/异常）时 Load 自动回退独立窗口；
+//   - 窗口缩放与显示器 DPI 变化时让覆盖窗口重新铺满客户区，否则嵌入画面
+//     会停在旧尺寸上。
+func attachEmbedWindow(win *application.WebviewWindow) {
+	AttachEmbedWindow(func() uintptr {
+		if win == nil {
+			return 0
+		}
+		return uintptr(win.NativeWindow())
+	})
+	win.OnWindowEvent(events.Common.WindowDidResize,
+		func(*application.WindowEvent) { resizeCurrentEmbed() })
+	win.OnWindowEvent(events.Common.WindowDPIChanged,
+		func(*application.WindowEvent) { resizeCurrentEmbed() })
 }

@@ -55,6 +55,81 @@
 > 09-01 快照之后合入 master 的更新。下方「M4 之后新增的功能（本次会话）」为当时的
 > 冻结快照，保留作历史记录，不再更新。
 
+- **mpv 整窗接管（Windows：画面嵌入主窗口，不再弹独立窗口）**（2026-10-03）：
+  - **架构**：`shell.Embed` 在播放器链上挂 `embedder` 装饰器（`internal/shell/embed.go`）：
+    `Load` 前显示覆盖子窗口并把其句柄经 `player.Embedder.SetEmbedWindow` → `--wid` 喂给
+    mpv，`Load` 失败 / `Close` / 终端事件（EOF/Error/Quit）时隐藏覆盖窗口把 UI 还回来。
+    覆盖窗口是 `winOverlay`（`embed_windows.go`，WS_CHILD 铺满主窗口客户区、置顶于
+    WebView 之上、黑底箭头光标）；拿不到宿主（句柄 0）恒回退 `--force-window` 独立窗口。
+  - **接线三处**：`OpenWindow → attachEmbedWindow`（宿主句柄闭包延迟注入 +
+    `WindowDidResize`/`WindowDPIChanged` → overlay 重新铺满）；`cmd/unbox/main.go`
+    `failover.New(shell.Embed(p), …)`——**Embed 必须在 failover 之下**，否则故障切换的
+    Load 绕过嵌入层；`RefreshMPV → attachMPVPlayer`（换入同时重启事件桥接到新通道——
+    顺带修复了既有问题：换入后桥接可能一直阻塞在旧通道，前端从此收不到 playback:event）。
+  - **mpv 进程自然退出检测**（`mpvproc.onConnectionEnd`）：读循环终止且会话仍登记 =
+    mpv 自己退了（OSC 关闭按钮 exit 0、崩溃/被杀非 0）→ 认领拆解、状态复位、上报新事件
+    `player.EventQuit`（0，**不**触发 failover 故障切换）或 `EventError`（非 0，带退出码，
+    故障切换照常）。此前进程退出后状态永远停在 playing、无人收场——嵌入模式下这会让
+    覆盖窗口永远盖住 UI，是接管路线的前置必修项。`sendEvent` 把 Quit 列入阻塞送达的
+    终端事件；`playbackEventFor` 不向前端转发 Quit（与独立窗口时代关窗无感一致，
+    前端会话状态保持到下一次播放）。
+  - **Win32 消息线程模型（实测踩死锁，勿删）**：goroutine 会在 OS 线程间迁移，
+    不 `LockOSThread` 时同一 goroutine 的两次窗口 API 调用可能落到不同线程，
+    同窗口操作退化成跨线程 SendMessage；窗口 owner 线程不泵消息则发送方无限
+    阻塞。三个配套修复缺一不可：① `startOverlayPump`——覆盖窗口的所有
+    创建/显隐/缩放排到一条 `LockOSThread`+`PeekMessage` 泵线程（`runOverlayOp`）；
+    ② `runOverlayOp` 等待期间持续泵**调用方**线程的队列——调用方恰是父窗口
+    owner 时（测试线程、Wails 线程的 resize 事件），泵线程里的 `CreateWindowEx`
+    会向父窗口同步回投消息，不泵即互锁；③ `syncChildrenLocked` 用
+    `SetWindowPos+SWP_ASYNCWINDOWPOS` 向 mpv 子窗口（另一进程线程）异步改尺寸，
+    避免与 mpv 的反向同步消息互等。测试侧对应 `newTestParentWindow` 开头的
+    `runtime.LockOSThread`。修前现象：`TestWinOverlayHostsMPVChildWindow`
+    偶发在 `MoveWindow` 卡死 30s+，修后 `count=3` 18/18 稳定通过。
+  - **DPI 前提**：Wails 启动时 `setupDPIAwareness` 把进程设为 Per-Monitor V2，overlay、
+    mpv、`GetWindowRect` 同在物理坐标系；`go test` 进程没有 Wails 初始化，须自行
+    `SetProcessDpiAwarenessContext`（`embed_windows_test.go` 已做），否则 DPI 虚拟化让
+    同一进程对两个窗口读出不同缩放系的矩形（曾把集成测试断言带偏）。
+  - **平台边界**：macOS mpv 不支持 `--wid`（M1 设计文档已判定），恒独立窗口；Linux
+    嵌入需 cgo 取 X11 XID（M1 Plan 4 有方案），本次未做，`noopOverlay` 回退独立窗口。
+  - **验证（TDD，全绿）**：`mpvproc` 3 个自然退出测试（helper 进程 exit 0/7、Close 静默）；
+    `shell` 8 个装饰器 fake 测试 + 6 个 Win32 真窗 overlay 测试 +
+    `TestWinOverlayHostsMPVChildWindow`（真 mpv `--wid`：子窗口铺满覆盖窗口、宿主缩放
+    后跟随）+ `TestAttachMPVPlayerSwapsControllerAndRestartsBridge`；全量
+    `go test ./...`、`go vet`、`gofmt` 干净（library 4 个既有 Windows 平台性失败不变）。
+  - **已知边界**：播放期间主窗口 UI 被 mpv 整窗覆盖（路线 A 即如此设计，OSC 提供控制）；
+    `--wid` 下 mpv 自身的全屏能力受限；日志在每次 Load 打「mpv 整窗接管已启用（overlay
+    hwnd=…）」或「嵌入宿主不可用，mpv 以独立窗口播放」，冒烟时看 log 即可确认走的哪条路。
+
+- **mpv「启动后立即退出」根因闭环 + Windows 管道/进程生命周期四处修复**（2026-10-02）：
+  - **根因**：`mpv.exe` 直跑退出码 `0xC0000135`（缺 DLL，且没有 stderr 输出，所以此前
+    只剩一句「mpv 启动后立即退出」）。逐个 LoadLibrary 探测其 45 个导入，唯一缺失
+    `vulkan-1.dll`（本机无 Vulkan ICD）。把官方 mpv v0.41.0 包内的 `vulkan-1.dll` 放进
+    运行目录 `mpv/` 即恢复；老 VulkanRT 的 loader 缺 `vkEnumerateInstanceVersion` 导出
+    会变成 `0xC0000139`（入口点缺失），不能拿它顶替。
+  - **退出码诊断**（TDD，`mpvproc/exitcode.go`）：IPC 连不上且进程已退出时，错误尾随
+    `（退出码 0x2A）` 并给出中文解释（`0xC0000135` 缺少依赖 DLL、`0xC0000139` 版本过旧、
+    `0xC0000142` 初始化失败）。测试 `TestLoadReportsExitCodeWhenMPVDiesEarly` /
+    `TestLoadExplainsWindowsLoaderExitCode`。
+  - **命名管道必须 OVERLAPPED**（`ipc_windows.go` 的 `dialIPC`）：`os.OpenFile` 打开的
+    非 OVERLAPPED 句柄不进 Go 轮询器，readLoop 的并发读与 send 的命令写互相卡死——
+    写 IRP 永远不完成，表现为 send 无限阻塞在 WriteFile（集成测试曾卡到 ctx 超时）。
+    改用 `syscall.CreateFile(..., FILE_FLAG_OVERLAPPED)` + `os.NewFile`。
+  - **管道名带进程 PID**（`unbox-mpv-<pid>-<seq>`）：崩溃/被杀的上一进程可能留下还占着
+    管道的僵尸 mpv，新进程 seq 从 1 重开会连上它，同样表现为 WriteFile 永久阻塞。
+  - **PATH 查找用 mpv.exe**（`mpvplugin.ExeForOS` 导出，`pick.go` 与集成测试共用）：
+    裸 `mpv` 按 PATHEXT 优先命中 `mpv.com` 启动器，真 mpv.exe 是孙进程，Close 的
+    `Kill` 只杀得到启动器 → 真 mpv 泄漏并把收尸管道攥住，`w.wait()` 永久挂起。
+  - **会话认领/拆解统一 + 在飞命令即刻放行**（`mpvproc.go` 的 `session`）：Close、
+    应答超时、Load 失败清理、并发 Load 顶替四条路径共用「锁内认领、锁外拆解」；
+    `done` 关闭让在飞 send 立即返回而不是干等 5s 应答超时；并发 Load 顶掉的旧会话
+    就地收尸（原实现直接覆盖 `p.cmd`，被覆盖的 mpv 无人认领，压测每次运行泄漏一个）。
+  - **集成测试可在 Windows 实跑**：`TestLoadPlayClose`/`TestConcurrentReload` 此前在任何
+    环境都没真跑过（CI 无 mpv、Windows 上因上述问题必挂）。测试须消费 `Events()`
+    （不消费时终端事件按设计阻塞发送 → readLoop 停读 → 管道写满 → mpv 卡死），
+    状态断言放行 stopped（假 URL 快速报错与断言竞速）。
+  - 验证：`go test ./...`（本机 PATH 带 mpv；除 `internal/library`+`thumb` 4 个既有的
+    Windows 平台性失败外全绿）、`go vet ./...`、`gofmt -l`、`go mod tidy` 干净。
+
 - **Wails beta.9 → beta.26 升级**（`6d083c15`，2026-10-01）：Wails v3 落后 17 个 beta
   后跟上。版本是**四处锁**，必须同步：`go.mod`、`mise.toml`、`.github/workflows/release.yml`
   的 `wails3@`、`frontend/package.json` 的 `@wailsio/runtime`（npm 与 Go 版本严格一一对应），
@@ -277,9 +352,12 @@
 - **M3 本地媒体库**：✅ 已完成（基础 merge `adcc8f3e`，首帧海报与布局修复已合入 master，
   2026-09-07），详见上方「近期更新」。
 - **Windows/macOS 实测**：打包已由 GH Actions 自动化；Windows NSIS 内嵌 mpv 的下载、解压、安装包执行和无系统 mpv 播放仍需 Windows 宿主机实测，macOS 仍需验证外部 mpv 安装与播放。
-- **回访报 mpv 报错的用户**：mpv 诊断三层已就位，但**尚未收到真实环境反馈**。下次出包后
-  让该用户复现，确认新报错是否指出了具体原因（缺 DLL / 杀软拦截 / 版本过低）；若仍是
-  「启动后立即退出」而无 stderr 输出，说明是我们的参数或环境问题，需另查。
+- **回访报 mpv 报错的用户**：✅ 已定位（2026-10-02）——「启动后立即退出」且无 stderr
+  输出 = 缺 `vulkan-1.dll`（退出码 `0xC0000135`），已补退出码诊断并实测恢复。下次出包后
+  仍建议让该用户复现，确认新报错能直接指出缺 DLL / 版本过旧。
+- **`internal/library` + `internal/library/thumb` 4 个测试在 Windows 宿主失败**（既有，
+  非功能问题）：fake mpv fixture 是 `fake-mpv.sh`（Windows fork/exec 不了）、`filepath.Rel`
+  跨盘符（仓库在 D:、临时目录在 C:）、`file://` 路径格式断言按 Linux 写。CI（Linux）全绿。
 - 停车项：failover `Events()` fan-out、probe 同步阻塞 `Load`、tvbox 剧集缓存上限、
   点播收藏等。
 

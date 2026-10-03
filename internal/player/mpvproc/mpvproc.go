@@ -50,6 +50,10 @@ type mpvProc struct {
 	sendMu    sync.Mutex    // 串行化命令：保证任一时刻只有一条命令在飞
 	responses chan response // readLoop 路由来的命令应答（带会话代际）
 	events    chan player.Event
+	// done 在当前会话被拆除（Close / 应答超时清理 / 被新 Load 顶掉）时关闭，
+	// 让在飞的 send 立即返回，而不是干等 cmdResponseTimeout。与 conn 一样
+	// 按「锁内认领、锁外使用」保证只被关闭一次。
+	done chan struct{}
 
 	stateMu sync.Mutex
 	state   player.State
@@ -60,7 +64,9 @@ type mpvProc struct {
 
 // New 以指定 mpv 可执行文件启动一个播放器实例。
 //
-// 本层负责 mpv 进程生命周期与 JSON IPC 对话；默认使用独立窗口。
+// 本层负责 mpv 进程生命周期与 JSON IPC 对话。窗口形态由 SetEmbedWindow
+// 决定：shell 层嵌入装饰器喂入宿主句柄时 mpv 渲染进主窗口（--wid），
+// 句柄为 0 时独立开窗（--force-window）。
 func New(exePath string) (player.Player, error) {
 	if _, err := os.Stat(exePath); err != nil {
 		return nil, fmt.Errorf("mpv 可执行文件不可用: %w", err)
@@ -71,6 +77,67 @@ func New(exePath string) (player.Player, error) {
 		events:    make(chan player.Event, 64),
 		state:     player.State{Playing: player.StateStopped, Duration: -1},
 	}, nil
+}
+
+// session 是一整套会话资源的认领快照。拆解一律「锁内认领、锁外执行」，
+// Close、应答超时清理、Load 失败清理、并发 Load 顶替四条路径共用。
+type session struct {
+	conn    io.ReadWriteCloser
+	cmd     *exec.Cmd
+	wait    *waiter
+	ipcPath string
+	done    chan struct{}
+}
+
+// claimSessionLocked 快照并置空当前会话（调用方须持有 lifecycleMu）。
+// 无可认领资源时返回 nil。
+func (p *mpvProc) claimSessionLocked() *session {
+	s := &session{
+		conn: p.conn, cmd: p.cmd, wait: p.wait,
+		ipcPath: p.ipcPath, done: p.done,
+	}
+	p.conn, p.cmd, p.wait, p.ipcPath, p.done = nil, nil, nil, "", nil
+	if s.conn == nil && s.cmd == nil && s.done == nil && s.ipcPath == "" {
+		return nil
+	}
+	return s
+}
+
+// teardown 拆解一个被认领的会话：关连接、放行在飞命令、杀进程收尸、清理
+// IPC 端点。s 为 nil（本就无会话）时是空操作。
+func (s *session) teardown() {
+	if s == nil {
+		return
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+	if s.done != nil {
+		close(s.done) // 放行在飞的 send，避免它干等 5s 应答超时
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+	}
+	// Kill 之后 Wait 立即返回；wait 为 nil（本就无进程）时是空操作。
+	_ = s.wait.wait()
+	if s.ipcPath != "" {
+		cleanupIPC(s.ipcPath)
+	}
+}
+
+// registerSession 登记新会话并返回其代际。并发 Load 下可能顶掉刚登记的
+// 旧会话（Load 开头的 Close 在它出生之前跑过）——被顶掉的会话必须就地拆解，
+// 否则它的 mpv 无人认领，进程与窗口永久泄漏。
+func (p *mpvProc) registerSession(cmd *exec.Cmd, w *waiter, conn io.ReadWriteCloser, ipcPath string) int64 {
+	p.lifecycleMu.Lock()
+	displaced := p.claimSessionLocked()
+	p.session++
+	sess := p.session
+	p.cmd, p.wait, p.conn, p.ipcPath = cmd, w, conn, ipcPath
+	p.done = make(chan struct{})
+	p.lifecycleMu.Unlock()
+	displaced.teardown()
+	return sess
 }
 
 func (p *mpvProc) Load(ctx context.Context, s player.Stream) error {
@@ -103,20 +170,13 @@ func (p *mpvProc) Load(ctx context.Context, s player.Stream) error {
 
 	conn, err := waitForIPC(dialIPC, ipcPath, ipcConnectTimeout, w)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = w.wait() // 等收尸完成，此后 stderr 不再有写入
-		cleanupIPC(ipcPath)
-		return mpvLoadError(err, stderr.String())
+		// 认领并拆掉刚启动的半成品会话：杀进程、收尸（此后 stderr 不再有
+		// 写入、ProcessState 可读）、清理 IPC 端点。
+		(&session{cmd: cmd, wait: w, ipcPath: ipcPath}).teardown()
+		return mpvLoadError(withExitCode(err, cmd.ProcessState), stderr.String())
 	}
 
-	p.lifecycleMu.Lock()
-	p.session++
-	sess := p.session
-	p.cmd = cmd
-	p.wait = w
-	p.conn = conn
-	p.ipcPath = ipcPath
-	p.lifecycleMu.Unlock()
+	sess := p.registerSession(cmd, w, conn, ipcPath)
 	p.stateMu.Lock()
 	p.state = player.State{Playing: player.StatePlaying, Duration: -1, Volume: 80}
 	p.paused = false
@@ -186,29 +246,11 @@ func (p *mpvProc) State() player.State {
 func (p *mpvProc) Events() <-chan player.Event { return p.events }
 
 func (p *mpvProc) Close() error {
-	// 在 lifecycleMu 下快照并置空，锁外再执行 IO，保证幂等且不持锁阻塞。
+	// 锁内认领（幂等：无会话时认领到 nil），锁外拆解，保证不持锁做 IO。
 	p.lifecycleMu.Lock()
-	conn := p.conn
-	cmd := p.cmd
-	w := p.wait
-	ipcPath := p.ipcPath
-	p.conn = nil
-	p.cmd = nil
-	p.wait = nil
-	p.ipcPath = ""
+	s := p.claimSessionLocked()
 	p.lifecycleMu.Unlock()
-
-	if conn != nil {
-		_ = conn.Close()
-	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	// Kill 之后 Wait 立即返回；w 为 nil（本就无会话）时是空操作。
-	_ = w.wait()
-	if ipcPath != "" {
-		cleanupIPC(ipcPath)
-	}
+	s.teardown()
 	return nil
 }
 
@@ -218,11 +260,12 @@ func (p *mpvProc) send(args ...any) error {
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
 
-	// 快照当前 conn 与会话代际；并发 Close 只关掉旧 conn，此处 Write 返回
-	// error 而非 nil-deref。不持锁等应答。
+	// 快照当前 conn、会话代际与拆除信号；并发 Close 只关掉旧 conn，此处
+	// Write 返回 error 而非 nil-deref。不持锁等应答。
 	p.lifecycleMu.Lock()
 	c := p.conn
 	sess := p.session
+	done := p.done
 	p.lifecycleMu.Unlock()
 	if c == nil {
 		return errors.New("mpvproc: 尚未 Load")
@@ -235,6 +278,9 @@ func (p *mpvProc) send(args ...any) error {
 	defer timer.Stop()
 	for {
 		select {
+		case <-done:
+			// 会话已被拆除（Close/应答超时清理/新 Load 顶替）：应答不会再来了。
+			return errors.New("mpvproc: 会话已关闭")
 		case r := <-p.responses:
 			if r.session != sess {
 				continue // 跨会话串味的迟到应答，丢弃继续等
@@ -254,33 +300,14 @@ func (p *mpvProc) send(args ...any) error {
 			// 时才拆解，否则说明 Load 已重入建立新会话，不得误杀后继。
 			p.lifecycleMu.Lock()
 			same := p.conn == c
-			var conn io.ReadWriteCloser
-			var cmd *exec.Cmd
-			var w *waiter
-			var ipcPath string
+			var s *session
 			if same {
-				conn = p.conn
-				cmd = p.cmd
-				w = p.wait
-				ipcPath = p.ipcPath
-				p.conn = nil
-				p.cmd = nil
-				p.wait = nil
-				p.ipcPath = ""
+				s = p.claimSessionLocked()
 			}
 			p.lifecycleMu.Unlock()
 
 			if same {
-				if conn != nil {
-					_ = conn.Close()
-				}
-				if cmd != nil && cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
-				_ = w.wait()
-				if ipcPath != "" {
-					cleanupIPC(ipcPath)
-				}
+				s.teardown()
 				p.stateMu.Lock()
 				p.state.Playing = player.StateStopped
 				p.stateMu.Unlock()
@@ -356,13 +383,56 @@ func (p *mpvProc) readLoop(conn io.ReadWriteCloser, sess int64) {
 		default: // 无命令在等（理论上不应发生）
 		}
 	}
+	// 连接断开：要么是本方主动拆除（已认领会话），要么是 mpv 进程自然退出。
+	p.onConnectionEnd(conn, sess)
 }
 
-// sendEvent 把事件发往通道：终端事件（EOF/Error）阻塞发送保证送达
-// （失败自动切换依赖它们），其余事件通道满则丢弃以避免阻塞读循环。
+// onConnectionEnd 在读循环终止后判断会话归属。连接断开有两种来源：
+//  1. Close / 应答超时 / 新 Load 顶替等主动拆除——它们已把 p.conn 置空或换成
+//     新连接，这里直接返回；事件与状态由拆除方负责，绝不重复收尸；
+//  2. mpv 进程自然退出（OSC 关闭按钮 exit 0、崩溃或被外部杀掉，IPC 随之
+//     EOF）——会话仍登记在本连接上，此时认领并拆解、复位状态，并按退出码
+//     上报 EventQuit（0，用户主动关闭，不触发故障切换）或 EventError
+//     （非 0，异常退出，故障切换与错误提示依赖它）。
+func (p *mpvProc) onConnectionEnd(conn io.ReadWriteCloser, sess int64) {
+	p.lifecycleMu.Lock()
+	if p.conn != conn || p.session != sess {
+		p.lifecycleMu.Unlock()
+		return
+	}
+	s := p.claimSessionLocked()
+	p.lifecycleMu.Unlock()
+
+	// 进程已死：Kill 幂等，wait 立即返回，顺带完成 IPC 端点清理。
+	s.teardown()
+
+	code := -1
+	if s.cmd != nil && s.cmd.ProcessState != nil {
+		code = s.cmd.ProcessState.ExitCode()
+	}
+	p.stateMu.Lock()
+	p.state.Playing = player.StateStopped
+	p.paused = false
+	p.stateMu.Unlock()
+
+	if code == 0 {
+		sendEvent(p.events, player.Event{Kind: player.EventQuit})
+		return
+	}
+	if hint := exitHint(code); hint != "" {
+		sendEvent(p.events, player.Event{Kind: player.EventError,
+			Err: fmt.Errorf("mpv 进程异常退出（退出码 %d：%s）", code, hint)})
+		return
+	}
+	sendEvent(p.events, player.Event{Kind: player.EventError,
+		Err: fmt.Errorf("mpv 进程异常退出（退出码 %d）", code)})
+}
+
+// sendEvent 把事件发往通道：终端事件（EOF/Error/Quit）阻塞发送保证送达
+// （失败自动切换与嵌入层收场依赖它们），其余事件通道满则丢弃以避免阻塞读循环。
 func sendEvent(ch chan<- player.Event, evt player.Event) {
 	switch evt.Kind {
-	case player.EventEOF, player.EventError:
+	case player.EventEOF, player.EventError, player.EventQuit:
 		ch <- evt
 	default:
 		select {

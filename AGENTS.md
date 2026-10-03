@@ -56,7 +56,8 @@ mise run scan          # go run ./cmd/unbox-scan
 - `internal/provider` — 内容来源抽象；`internal/provider/live` — M3U/TXT；`internal/provider/tvbox` — CMS/Drpy。
 - `internal/probe` — URL 探测 / 测速排序。
 - `internal/player` — 播放器接口（`Player`）；
-  - `mpvproc` — mpv 子进程 + JSON IPC（三平台统一，独立窗口）；
+  - `mpvproc` — mpv 子进程 + JSON IPC（三平台统一；Windows 经 `shell.Embed` 整窗接管
+    主窗口，句柄 0 / 其他平台回退独立窗口）；
   - `mpvplugin` — 外部 mpv 探测 + 安装兜底（Windows NSIS 安装包优先使用应用目录内嵌 mpv，随后检查用户插件目录和系统 PATH；Linux/macOS 仍弹安装命令）；
   - `failover` — 故障切换包装。
 - `internal/playback` — 播放编排：Resolver（share 页解析）→ Controller（Web/mpv 路由）
@@ -95,6 +96,15 @@ mise run scan          # go run ./cmd/unbox-scan
 - **mpv JSON IPC**：`set` 命令拒绝 bool/数字（用 `set_property`）；终端事件
   （EOF/Error）须阻塞发送。**`exec.Cmd.Wait` 只允许调用一次**：Close / 命令应答
   超时 / Load 失败清理三处共用 `waiter`（`mpvproc/waiter.go`）收尸，别改回各自 Wait。
+- **mpv 整窗接管（Windows）只在 shell 层**：`shell.Embed` 必须包在 failover **之下**
+  （`main.go` 的 `failover.New(shell.Embed(p), …)`），否则故障切换的 Load 绕过嵌入层；
+  宿主句柄由 `OpenWindow → attachEmbedWindow` 延迟注入（为 0 时回退独立窗口）；
+  `RefreshMPV` 走 `attachMPVPlayer`（换入 + 重启事件桥接）。覆盖窗口显隐与状态复位依赖
+  `mpvproc.onConnectionEnd` 的自然退出上报（`EventQuit`/`EventError`），别删。macOS 不支持
+  `--wid` 恒回退；Linux 嵌入未做（`noopOverlay`）。**Win32 线程模型三件套缺一不可**
+  （详见 HANDOFF）：overlay 窗口操作必须经 `runOverlayOp` 排到 `startOverlayPump` 的
+  加锁泵线程、`runOverlayOp` 等待侧泵调用方自己的队列、mpv 子窗口用
+  `SWP_ASYNCWINDOWPOS` 异步同步——否则偶发 30s+ 死锁。
 - **mpv 起不来时错误必须能定位**：`mpvplugin.NewPlayer()` 先跑 `mpv --version` 预检
   （`mpvplugin/version.go`）——跑不起来（缺 DLL / 被杀软拦截）或版本低于
   `minMPVVersion` 都当场报错；`mpvproc` 保留子进程 stderr 末尾 4KB（`stderr.go`），

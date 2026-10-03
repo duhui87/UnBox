@@ -23,7 +23,9 @@ var pluginStatus = func() mpvplugin.Status {
 // 所有平台都通过 mpvproc 驱动外部 mpv 子进程。
 // mpv 缺失时返回明确错误而非 panic，调用方（cmd/unbox）据此刻画「播放器未就绪」。
 func PickPlayer() (player.Player, error) {
-	exe, err := lookPath("mpv")
+	// 按平台名查找（Windows 为 mpv.exe）：裸 "mpv" 会优先命中 mpv.com 启动器，
+	// 其拉起的真 mpv.exe 是孙进程，mpvproc.Close 的 Kill 杀不到它。
+	exe, err := lookPath(mpvplugin.ExeForOS(runtime.GOOS))
 	if err == nil {
 		return mpvproc.New(exe)
 	}

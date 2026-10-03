@@ -74,7 +74,7 @@ func (m *Manager) Status() Status {
 	if path := m.pluginPath(); path != "" {
 		return Status{Available: true, Path: path}
 	}
-	if path, err := m.lookPath(exeForOS(m.goos)); err == nil {
+	if path, err := m.lookPath(ExeForOS(m.goos)); err == nil {
 		return Status{Available: true, Path: path}
 	}
 	s := Status{InstallMode: "manual"}
@@ -165,7 +165,7 @@ func (m *Manager) installWindows(ctx context.Context) (InstallResult, error) {
 }
 
 func (m *Manager) pluginPath() string {
-	path := filepath.Join(m.root, "unbox", "plugins", "mpv", exeForOS(m.goos))
+	path := filepath.Join(m.root, "unbox", "plugins", "mpv", ExeForOS(m.goos))
 	if _, err := os.Stat(path); err == nil {
 		return path
 	}
@@ -182,14 +182,20 @@ func (m *Manager) bundledPath() string {
 	if err != nil {
 		return ""
 	}
-	p := filepath.Join(filepath.Dir(exe), "mpv", exeForOS(m.goos))
+	p := filepath.Join(filepath.Dir(exe), "mpv", ExeForOS(m.goos))
 	if _, err := os.Stat(p); err == nil {
 		return p
 	}
 	return ""
 }
 
-func exeForOS(goos string) string {
+// ExeForOS 返回给定平台用于查找/拼接 mpv 的可执行文件名。
+//
+// Windows 必须显式用 mpv.exe：exec.LookPath("mpv") 按 PATHEXT 顺序优先命中
+// 同目录下的 mpv.com 启动器（控制台转发用），而 mpv.com 拉起的真 mpv.exe 是
+// 独立孙进程——mpvproc.Close 只能 Kill 启动器，真 mpv 泄漏并攥住继承的
+// stdout/stderr 管道，收尸永久挂起。
+func ExeForOS(goos string) string {
 	if goos == "windows" {
 		return "mpv.exe"
 	}
